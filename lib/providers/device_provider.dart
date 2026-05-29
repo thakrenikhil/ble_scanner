@@ -1,51 +1,70 @@
 import 'dart:async';
 import 'dart:convert';
-
-import 'package:ble_vitals_scanner/constants/ble_constants.dart';
-import 'package:ble_vitals_scanner/models/device_state.dart';
-import 'package:ble_vitals_scanner/models/discovered_characteristic.dart';
-import 'package:ble_vitals_scanner/providers/ble_provider.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:riverpod/riverpod.dart';
+import '../constants/ble_constants.dart';
+import '../models/device_state.dart';
+import '../models/discovered_characteristic.dart';
+import 'ble_provider.dart';
 
 class DeviceNotifier extends StateNotifier<DeviceState> {
   final FlutterReactiveBle _ble;
   final String _deviceId;
   StreamSubscription<ConnectionStateUpdate>? _connectionSub;
   StreamSubscription<List<int>>? _notifySub;
+  bool _connectInProgress = false;
 
   DeviceNotifier(this._ble, this._deviceId) : super(DeviceState());
 
-  //connect to the device
   void connect() {
+    if (_connectionSub != null || _connectInProgress) return;
+    _connectInProgress = true;
     state = state.copyWith(connectionError: null);
     _connectionSub = _ble
         .connectToDevice(
-          id: _deviceId,
-          connectionTimeout: const Duration(seconds: 10),
-        )
+      id: _deviceId,
+      connectionTimeout: const Duration(seconds: 10),
+    )
         .listen(
-          _onConnectionUpdate,
-          onError: (error) {
-            state = state.copyWith(
-              connectionState: DeviceConnectionState.disconnected,
-              connectionError: error.toString(),
-            );
-          },
+      (update) {
+        _onConnectionUpdate(update).catchError((Object error) {
+          state = state.copyWith(
+            connectionState: DeviceConnectionState.disconnected,
+            connectionError: error.toString(),
+          );
+        });
+      },
+      onError: (error) {
+        _connectInProgress = false;
+        state = state.copyWith(
+          connectionState: DeviceConnectionState.disconnected,
+          connectionError: error.toString(),
         );
+      },
+      onDone: () {
+        _connectInProgress = false;
+        _connectionSub = null;
+      },
+    );
   }
 
   Future<void> _onConnectionUpdate(ConnectionStateUpdate update) async {
     state = state.copyWith(connectionState: update.connectionState);
 
     if (update.connectionState == DeviceConnectionState.connected) {
+      _connectInProgress = false;
       await _discoverServices();
+      if (state.connectionState != DeviceConnectionState.connected) return;
       await _readDeviceInfo();
-      _subscribeToSensorData();
+      if (state.connectionState != DeviceConnectionState.connected) return;
+      await _subscribeToSensorData();
+      return;
     }
 
     if (update.connectionState == DeviceConnectionState.disconnected) {
-      _notifySub?.cancel();
+      _connectInProgress = false;
+      await _notifySub?.cancel();
+      _notifySub = null;
       state = state.copyWith(
         isSubscribed: false,
         services: [],
@@ -54,28 +73,23 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
     }
   }
 
-  //discover services
   Future<void> _discoverServices() async {
     try {
-      final services = await _ble.discoverServices(_deviceId);
+      final services = await _ble.discoverServices(_deviceId);//Depricating need to fix
       final characteristics = <DiscoveredCharacteristicItem>[];
 
       for (final service in services) {
         for (final char in service.characteristics) {
-          characteristics.add(
-            DiscoveredCharacteristicItem(
-              characteristic: QualifiedCharacteristic(
-                serviceId: service.serviceId,
-                characteristicId: char.characteristicId,
-                deviceId: _deviceId,
-              ),
-              isNotifiable: char.isNotifiable,
-              isReadable: char.isReadable,
-              isWritable:
-                  char.isWritableWithResponse ||
-                  char.isWritableWithoutResponse,
+          characteristics.add(DiscoveredCharacteristicItem(
+            characteristic: QualifiedCharacteristic(
+              serviceId: service.serviceId,
+              characteristicId: char.characteristicId,
+              deviceId: _deviceId,
             ),
-          );
+            isNotifiable: char.isNotifiable,
+            isReadable: char.isReadable,
+            isWritable: char.isWritableWithResponse || char.isWritableWithoutResponse,
+          ));
         }
       }
 
@@ -88,9 +102,6 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
     }
   }
 
-  //read characteristic
-
-  //read device info
   Future<void> _readDeviceInfo() async {
     try {
       final char = QualifiedCharacteristic(
@@ -101,59 +112,147 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
       final bytes = await _ble.readCharacteristic(char);
       state = state.copyWith(deviceInfoValue: utf8.decode(bytes));
     } catch (_) {
-      //  errors for device info
+      // not fatal — simulator may not have this char
     }
   }
 
-  //subscribe to sensor data
-  void _subscribeToSensorData() {
+  Future<void> _subscribeToSensorData() async {
+    if (state.connectionState != DeviceConnectionState.connected) return;
+
+    final sensorUuid = Uuid.parse(kSensorDataUuid);
+    final discovered = state.characteristics
+        .where((item) => item.characteristic.characteristicId == sensorUuid)
+        .toList();
+
+    if (discovered.isEmpty) {
+      state = state.copyWith(
+        liveValue: 'Sensor characteristic not found on device',
+        isSubscribed: false,
+      );
+      return;
+    }
+
+    if (!discovered.first.isNotifiable) {
+      state = state.copyWith(
+        liveValue: 'Sensor characteristic is not notifiable',
+        isSubscribed: false,
+      );
+      return;
+    }
+
+    await _notifySub?.cancel();
+    _notifySub = null;
+
+    final char = discovered.first.characteristic;
+    try {
+      _notifySub = _ble
+          .subscribeToCharacteristic(char)
+          .handleError((Object error) {
+            if (state.connectionState == DeviceConnectionState.connected) {
+              state = state.copyWith(
+                liveValue: 'Subscribe error: $error',
+                isSubscribed: false,
+              );
+            }
+          })
+          .listen(
+        (data) {
+          state = state.copyWith(
+            liveValue: utf8.decode(data),
+            isSubscribed: true,
+          );
+        },
+        onError: (error) {
+          state = state.copyWith(
+            liveValue: 'Subscribe error: $error',
+            isSubscribed: false,
+          );
+        },
+        cancelOnError: false,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        liveValue: 'Subscribe error: $e',
+        isSubscribed: false,
+      );
+    }
+  }
+
+  Future<void> writeControl(String value) async {
     try {
       final char = QualifiedCharacteristic(
         serviceId: Uuid.parse(kServiceUuid),
-        characteristicId: Uuid.parse(kSensorDataUuid),
+        characteristicId: Uuid.parse(kControlUuid),
         deviceId: _deviceId,
       );
-
-      _notifySub = _ble
-          .subscribeToCharacteristic(char)
-          .listen(
-            (data) {
-              final decoded = utf8.decode(data);
-              state = state.copyWith(liveValue: decoded, isSubscribed: true);
-            },
-            onError: (error) {
-              state = state.copyWith(
-                liveValue: 'Error: $error',
-                isSubscribed: false,
-              );
-            },
-          );
+      await _ble.writeCharacteristicWithoutResponse(
+        char,
+        value: utf8.encode(value),
+      );
     } catch (e) {
-      state = state.copyWith(liveValue: 'Subscribe error: $e');
+      state = state.copyWith(
+        connectionError: 'Write failed: $e',
+      );
     }
   }
 
-  //disconnect and dispose
-  void disconnect() {
-    _connectionSub?.cancel();
-    _notifySub?.cancel();
-    _ble.deinitialize();
+  // Send data with response (waits for device acknowledgment)
+  Future<void> writeControlWithResponse(String value) async {
+    try {
+      final char = QualifiedCharacteristic(
+        serviceId: Uuid.parse(kServiceUuid),
+        characteristicId: Uuid.parse(kControlUuid),
+        deviceId: _deviceId,
+      );
+      await _ble.writeCharacteristicWithResponse(
+        char,
+        value: utf8.encode(value),
+      );
+    } catch (e) {
+      state = state.copyWith(
+        connectionError: 'Write with response failed: $e',
+      );
+    }
+  }
+
+  // Disconnect device properly without deinitializing BLE
+  Future<void> requestMtuSize(int mtuSize) async {
+    try {
+      await _ble.requestMtu(deviceId: _deviceId, mtu: mtuSize);
+    } catch (e) {
+      state = state.copyWith(connectionError: 'MTU request failed: $e');
+    }
+  }
+
+  Future<void> disconnect() async {
+    _connectInProgress = false;
+    await _notifySub?.cancel();
+    _notifySub = null;
+    await _connectionSub?.cancel();
+    _connectionSub = null;
+    state = state.copyWith(
+      connectionState: DeviceConnectionState.disconnected,
+      isSubscribed: false,
+      services: [],
+      characteristics: [],
+    );
+    // Do NOT call _ble.deinitialize() - it prevents reconnection
   }
 
   @override
   void dispose() {
-    disconnect();
+    unawaited(disconnect());
     super.dispose();
   }
 }
 
+/// Provides device state for a specific device
 final deviceProvider =
-    StateNotifierProvider.family<DeviceNotifier, DeviceState, String>((
-      ref,
-      deviceId,
-    ) {
-      final ble = ref.watch(bleProvider);
-      final notifier = DeviceNotifier(ble, deviceId);
-      ref.onDispose(notifier.dispose);
-      return notifier;
-    });
+    StateNotifierProvider.family<DeviceNotifier, DeviceState, String>(
+  (ref, deviceId) {
+    final ble = ref.watch(bleProvider);
+    final notifier = DeviceNotifier(ble, deviceId);
+    ref.onDispose(notifier.dispose);
+    return notifier;
+  },
+);
