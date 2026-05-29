@@ -25,9 +25,7 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
           connectionTimeout: const Duration(seconds: 10),
         )
         .listen(
-          (update) {
-            state = state.copyWith(connectionState: update.connectionState);
-          },
+          _onConnectionUpdate,
           onError: (error) {
             state = state.copyWith(
               connectionState: DeviceConnectionState.disconnected,
@@ -37,33 +35,47 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
         );
   }
 
+  Future<void> _onConnectionUpdate(ConnectionStateUpdate update) async {
+    state = state.copyWith(connectionState: update.connectionState);
 
-  
-  //get services and characteristics
+    if (update.connectionState == DeviceConnectionState.connected) {
+      await _discoverServices();
+      await _readDeviceInfo();
+      _subscribeToSensorData();
+    }
 
-
-
-
-
+    if (update.connectionState == DeviceConnectionState.disconnected) {
+      _notifySub?.cancel();
+      state = state.copyWith(
+        isSubscribed: false,
+        services: [],
+        characteristics: [],
+      );
+    }
+  }
 
   //discover services
- Future<void> _discoverServices() async {
+  Future<void> _discoverServices() async {
     try {
       final services = await _ble.discoverServices(_deviceId);
       final characteristics = <DiscoveredCharacteristicItem>[];
 
       for (final service in services) {
         for (final char in service.characteristics) {
-          characteristics.add(DiscoveredCharacteristicItem(
-            characteristic: QualifiedCharacteristic(
-              serviceId: service.serviceId,
-              characteristicId: char.characteristicId,
-              deviceId: _deviceId,
+          characteristics.add(
+            DiscoveredCharacteristicItem(
+              characteristic: QualifiedCharacteristic(
+                serviceId: service.serviceId,
+                characteristicId: char.characteristicId,
+                deviceId: _deviceId,
+              ),
+              isNotifiable: char.isNotifiable,
+              isReadable: char.isReadable,
+              isWritable:
+                  char.isWritableWithResponse ||
+                  char.isWritableWithoutResponse,
             ),
-            isNotifiable: char.isNotifiable,
-            isReadable: char.isReadable,
-            isWritable: char.isWritableWithoutResponse || char.isWritableWithoutResponse,
-          ));
+          );
         }
       }
 
@@ -76,11 +88,7 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
     }
   }
 
-
   //read characteristic
-
-
-
 
   //read device info
   Future<void> _readDeviceInfo() async {
@@ -106,48 +114,46 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
         deviceId: _deviceId,
       );
 
-      _notifySub = _ble.subscribeToCharacteristic(char).listen(
-        (data) {
-          final decoded = utf8.decode(data);
-          state = state.copyWith(
-            liveValue: decoded,
-            isSubscribed: true,
+      _notifySub = _ble
+          .subscribeToCharacteristic(char)
+          .listen(
+            (data) {
+              final decoded = utf8.decode(data);
+              state = state.copyWith(liveValue: decoded, isSubscribed: true);
+            },
+            onError: (error) {
+              state = state.copyWith(
+                liveValue: 'Error: $error',
+                isSubscribed: false,
+              );
+            },
           );
-        },
-        onError: (error) {
-          state = state.copyWith(
-            liveValue: 'Error: $error',
-            isSubscribed: false,
-          );
-        },
-      );
     } catch (e) {
       state = state.copyWith(liveValue: 'Subscribe error: $e');
     }
   }
 
   //disconnect and dispose
-   void disconnect() {
+  void disconnect() {
     _connectionSub?.cancel();
     _notifySub?.cancel();
     _ble.deinitialize();
   }
 
-   @override
+  @override
   void dispose() {
     disconnect();
     super.dispose();
   }
-
 }
 
-
 final deviceProvider =
-    StateNotifierProvider.family<DeviceNotifier, DeviceState, String>(
-  (ref, deviceId) {
-    final ble = ref.watch(bleProvider);
-    final notifier = DeviceNotifier(ble, deviceId);
-    ref.onDispose(notifier.dispose);
-    return notifier;
-  },
-);
+    StateNotifierProvider.family<DeviceNotifier, DeviceState, String>((
+      ref,
+      deviceId,
+    ) {
+      final ble = ref.watch(bleProvider);
+      final notifier = DeviceNotifier(ble, deviceId);
+      ref.onDispose(notifier.dispose);
+      return notifier;
+    });
